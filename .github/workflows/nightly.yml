@@ -58,7 +58,7 @@ jobs:
               GOOS=$GOOS GOARCH=$GOARCH \
                 go build -trimpath -ldflags "$LDFLAGS" \
                 -o dist/obadm_${GOOS}_${GOARCH} \
-                github.com/btraven00/obadm/cmd/obadm
+                ./cmd/obadm
             done
           done
 
@@ -67,7 +67,7 @@ jobs:
             GOOS=linux GOARCH=$GOARCH \
               go build -trimpath -ldflags "$LDFLAGS" \
               -o dist/obadm-agent_linux_${GOARCH} \
-              github.com/btraven00/obadm/cmd/obadm-agent
+              ./cmd/obadm-agent
           done
 
       - name: Checksums

@@ -1,2 +1,3 @@
-obadm
-obadm-agent
+/obadm
+/obadm-agent
+/dist/
