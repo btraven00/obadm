@@ -1,144 +1,83 @@
-# Local Cache, Replay, and Share — Design Spec
+# Local Cache, Replay, and Share
 
-## Motivation
+## Status
 
-`obadm stream` sits in the middle of the telemetry pipeline. At zero extra cost it
-can tee the raw JSONL to a local file, turning every run into a durable artifact
-keyed by its global span ID. This unlocks replay, offline analysis, and
-peer-to-peer sharing without any server-side infrastructure.
-
----
-
-## Run Cache
-
-### Layout
-
-Root via `os.UserCacheDir()` — `~/.cache` on Linux, `~/Library/Caches` on macOS.
-
-```
-$XDG_CACHE_HOME/obadm/runs/
-  <run-id>/
-    telemetry.jsonl   # raw line-delimited events as received from agent
-    meta.json         # run metadata
-```
-
-`<run-id>` is a UUID generated at session start. Span ID extraction from the
-first JSONL line (field name TBD) can be added later as an alias — the UUID
-remains the canonical key so the cache requires zero knowledge of the data
-structure.
-
-### `meta.json`
-
-```json
-{
-  "span_id":    "abc123",
-  "host":       "remote.example.com",
-  "remote_file": "/data/omnibenchmark/telemetry.jsonl",
-  "started_at": "2026-02-27T00:00:00Z",
-  "finished_at": null,
-  "lines":      14823
-}
-```
-
-`finished_at` is null while streaming is in progress (crash-safe sentinel).
-
-### Stream tee
-
-`obadm stream` wraps the SSH tunnel reader in an `io.TeeReader` before passing
-it to `otlp.Forward`:
-
-```
-agent → SSH tunnel → io.TeeReader ──→ local cache file
-                          └─────────→ otlp.Forward → Aspire
-```
-
-No new packages needed. The run UUID is generated with `github.com/google/uuid`
-(already a transitive dep). Span ID extraction is deferred — field name unknown
-at spike time.
+| Feature | State |
+|---|---|
+| Local cache tee (`io.TeeReader` → `telemetry.jsonl`) | **done** |
+| Resume protocol (`{"resume_line": N}` handshake) | **done** |
+| `obadm runs list` | **done** |
+| `obadm replay <id>` | **done** |
+| Persistent agent daemon (Unix socket) | **next spike** |
+| `obadm share` / `obadm receive` (Magic Wormhole) | **next spike** |
+| `obadm replay --from-line N` | deferred |
+| `obadm replay --speed 2.0` | deferred |
 
 ---
 
-## Reconnect / Broken Streams
+## Next Spike: Persistent Agent Daemon
 
-The resume cursor is the number of lines successfully written to the local cache
-— not bytes received, not records forwarded to OTLP. This guarantees line
-integrity across disconnects (the agent only emits complete `\n`-terminated lines;
-the cache only counts lines fully written to disk).
+### Problem
 
-On reconnect:
+Every `obadm stream` invocation — including auto-resume reconnects — spawns a
+new agent process via `ssh exec`. On unclean client exit the old agent lingers.
+Repeated reconnects can leave multiple agents tailing the same file.
 
-```
-resume_line = wc -l $XDG_CACHE_HOME/obadm/runs/<run-id>/telemetry.jsonl
-→ client sends {"resume_line": N} to agent before streaming begins
-→ agent seeks to line N+1 (bufio.Scanner skip loop)
-→ local cache file reopened O_APPEND
-→ OTLP replay of cached-but-not-forwarded lines triggered if Aspire was down
-```
+### Design
 
-### Test strategy (no real network drops needed)
+Make agent startup idempotent using a PID file and Unix domain socket at
+`~/.obadm/run/` on the remote host. Full design in
+[001-architecture.md](001-architecture.md#planned-persistent-daemon--unix-socket-forward).
 
-```go
-// simulate disconnect after 3 lines
-brokenReader := io.LimitReader(tunnelConn, bytesOfFirst3Lines)
-// write partial cache, then reconnect and verify resume from line 3
-```
+### Changes required
 
-The in-process SSH server already supports this pattern — inject the limit in the
-test, verify the resumed stream contains exactly the remaining lines with no
-duplicates or gaps.
+**`cmd/obadm-agent/main.go`**
+- Add `--daemon` flag
+- On startup: check `~/.obadm/run/agent.pid` via `kill(pid, 0)`
+  - PID alive + socket exists → exit 0
+  - Otherwise → write PID file, bind `agent.sock`, tail file
+- On exit: remove PID file and socket
+
+**`internal/sshconn/connect.go`**
+- Change `ensureAgent` to pass `--daemon` flag
+- Change port-forward logic to Unix socket forward (`ssh.Dial("unix", socketPath)`)
+- Remove `{"port": N}` stdout read (socket path is fixed: `~/.obadm/run/agent.sock`)
+
+**`internal/agent/server.go`** — no changes (protocol unchanged)
+
+**`cmd/obadm/main.go`** — no changes (interface unchanged)
+
+### Tests
+
+- `TestDaemon_IdempotentStart` — start daemon twice, verify only one process
+- `TestDaemon_Stalepid` — write stale PID file, verify fresh start
+- Existing `TestConnect_StreamsViaSSH` — update to use socket forward instead of TCP
 
 ---
 
-## New Commands
+## Next Spike: Share / Receive (Magic Wormhole)
 
-### `obadm runs list`
+### Design
 
-```
-SPAN ID     HOST                STARTED              LINES    STATUS
-abc123      remote.example.com  2026-02-27 00:00:00  14823    complete
-def456      remote.example.com  2026-02-28 00:00:00  3021     in-progress
-```
+Transfer a cached run directory to a peer using
+[wormhole-william](https://github.com/psanford/wormhole-william) — the pure-Go
+Magic Wormhole implementation. No server to operate; data is E2E encrypted;
+rendezvous via a public relay.
 
-### `obadm replay <span-id>`
+Interoperates with the standard Python `magic-wormhole` CLI on the receiver
+side.
 
-Reads `~/.obadm/runs/<span-id>/telemetry.jsonl` and re-emits to an OTLP
-endpoint. Reuses `otlp.Forward(ctx, file, addr)` unchanged — the only
-difference from `stream` is the source is a local `*os.File` instead of
-an SSH tunnel.
-
-Flags:
-- `--aspire` (default `localhost:4317`) — target OTLP endpoint
-- `--from-line N` — skip first N lines (partial replay)
-- `--speed 2.0` — replay at Nx wall-clock speed (optional stretch goal)
-
-### `obadm share <span-id>`
-
-Transfers `~/.obadm/runs/<span-id>/telemetry.jsonl` to a peer using the
-**Magic Wormhole** protocol (wormhole-william, the pure-Go implementation).
-
-#### Why Magic Wormhole
-
-- No server to operate — rendezvous via a public relay, data is E2E encrypted
-- Human-pronounceable code (`7-crossword-clockwork`) — easy to share over chat
-- Pure Go: `github.com/psanford/wormhole-william`
-- Receiver needs only `obadm receive` (or the standard `wormhole` CLI)
-
-#### Flow
+### `obadm share <run-id>`
 
 ```
-Sender:
-  obadm share abc123
-  → compresses run dir to tar.gz in memory
-  → initiates wormhole transfer
-  → prints: "wormhole code: 7-crossword-clockwork"
-
-Receiver:
-  obadm receive 7-crossword-clockwork
-  → downloads + decompresses into ~/.obadm/runs/<span-id>/
-  → ready for obadm replay
+obadm share abc123
+→ opens ~/.cache/obadm/runs/abc123/telemetry.jsonl
+→ initiates wormhole file transfer
+→ prints: wormhole code: 7-crossword-clockwork
+→ blocks until receiver connects and transfer completes
 ```
 
-#### Implementation sketch
+Implementation sketch:
 
 ```go
 import "github.com/psanford/wormhole-william/wormhole"
@@ -146,25 +85,27 @@ import "github.com/psanford/wormhole-william/wormhole"
 c := wormhole.Client{}
 code, status, err := c.SendFile(ctx, "telemetry.jsonl", file)
 fmt.Printf("wormhole code: %s\n", code)
-<-status  // wait for transfer completion
+s := <-status
+if s.Error != nil { ... }
 ```
 
-Interoperates with the Python `magic-wormhole` CLI — receiver doesn't need
-obadm installed.
+### `obadm receive <code>`
 
----
+```
+obadm receive 7-crossword-clockwork
+→ downloads telemetry.jsonl into ~/.cache/obadm/runs/<new-uuid>/
+→ writes meta.json with source noted
+→ ready for: obadm replay <new-uuid>
+```
 
-## Non-Goals
+### Changes required
 
-- Cloud storage / centralised run repository (out of scope)
-- Streaming share (share while run is in progress) — possible future extension
-- Encryption of local cache (OS filesystem permissions are sufficient for now)
+- Add `github.com/psanford/wormhole-william` to `go.mod`
+- Add `runShare(args)` and `runReceive(args)` to `cmd/obadm/main.go`
+- `internal/cache` — no changes (share/receive use existing `New` + `Writer`)
 
----
+### Non-goals
 
-## Implementation Order
-
-1. Local cache tee in `obadm stream` (prerequisite for everything else)
-2. `obadm runs list` (trivial once cache exists)
-3. `obadm replay` (reuses `otlp.Forward` unchanged)
-4. `obadm share` / `obadm receive` (self-contained, no coupling to stream)
+- Streaming share (share while run is in progress)
+- Encryption of local cache (OS filesystem permissions sufficient)
+- Cloud/centralised run repository

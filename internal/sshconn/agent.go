@@ -16,43 +16,83 @@ import (
 )
 
 const (
-	githubRepo = "omnibenchmark/obadm"
-	agentAsset = "obadm-agent_linux_amd64"
+	githubRepo   = "btraven00/obadm"
+	githubTag    = "nightly"
+	agentAsset   = "obadm-agent_linux_amd64"
 )
+
+// Deploy uploads localBinary to agentPath on the remote host via SFTP.
+// cfg must have Host set; User and IdentityFile are resolved from ~/.ssh/config.
+func Deploy(ctx context.Context, cfg Config, localBinary string) error {
+	r := resolve(cfg)
+	if r.identity == "" {
+		return fmt.Errorf("no identity file: set --identity or add IdentityFile to ~/.ssh/config for %q", cfg.Host)
+	}
+	signer, err := loadKey(ctx, r.identity)
+	if err != nil {
+		return err
+	}
+	sshClient, jumpClient, err := openSSHClient(ctx, r, signer)
+	if err != nil {
+		return err
+	}
+	defer sshClient.Close()
+	if jumpClient != nil {
+		defer jumpClient.Close()
+	}
+
+	sc, err := sftp.NewClient(sshClient)
+	if err != nil {
+		return fmt.Errorf("sftp: %w", err)
+	}
+	defer sc.Close()
+
+	rpath, err := expandRemoteTilde(sc, r.agentPath)
+	if err != nil {
+		return err
+	}
+	return uploadViaFTP(sc, localBinary, rpath)
+}
 
 // ensureAgent checks whether obadm-agent exists at agentPath on the remote
 // host. If not, it downloads the latest linux/amd64 release from GitHub and
-// uploads via SFTP. Returns the resolved (~ expanded) remote path.
-func ensureAgent(ctx context.Context, sshClient *gossh.Client, agentPath string) (string, error) {
+// uploads via SFTP. Returns the resolved agent path and resolved remoteFile path
+// (both with ~ expanded using the remote home directory).
+func ensureAgent(ctx context.Context, sshClient *gossh.Client, agentPath, remoteFile string) (agentRPath, fileRPath string, err error) {
 	sc, err := sftp.NewClient(sshClient)
 	if err != nil {
-		return "", fmt.Errorf("sftp client: %w", err)
+		return "", "", fmt.Errorf("sftp client: %w", err)
 	}
 	defer sc.Close()
 
 	rpath, err := expandRemoteTilde(sc, agentPath)
 	if err != nil {
-		return "", err
+		return "", "", err
+	}
+
+	fileRPath, err = expandRemoteTilde(sc, remoteFile)
+	if err != nil {
+		return "", "", err
 	}
 
 	if _, err := sc.Stat(rpath); err == nil {
 		log.Printf("agent found at %s", rpath)
-		return rpath, nil
+		return rpath, fileRPath, nil
 	}
 
 	log.Printf("agent not found at %s — downloading...", rpath)
 
 	tmpPath, err := downloadLatestAgent(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer os.Remove(tmpPath)
 
 	if err := uploadViaFTP(sc, tmpPath, rpath); err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return rpath, nil
+	return rpath, fileRPath, nil
 }
 
 // expandRemoteTilde replaces a leading ~/ with the SFTP working directory
@@ -76,7 +116,7 @@ type githubRelease struct {
 }
 
 func downloadLatestAgent(ctx context.Context) (string, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", githubRepo, githubTag)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return "", err
@@ -90,7 +130,7 @@ func downloadLatestAgent(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github releases API %s — no releases yet? build obadm-agent and set --agent-path", resp.Status)
+		return "", fmt.Errorf("github releases API %s (repo: %s, tag: %s)", resp.Status, githubRepo, githubTag)
 	}
 
 	var rel githubRelease

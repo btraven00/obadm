@@ -8,67 +8,169 @@ import (
 	"testing"
 	"time"
 
-	collectorlogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/btraven00/obadm/internal/otlp"
 )
 
-func TestForward_SendsLogRecords(t *testing.T) {
-	svc := &mockLogService{}
-	addr := startMockOTLP(t, svc)
+// Minimal valid OTLP proto-JSON payloads (base64-encoded IDs per proto3 JSON spec).
+const (
+	tracePayload = `{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test"}}]},"scopeSpans":[{"spans":[{"traceId":"AAAAAAAAAAAAAAAAAAAAAA==","spanId":"AAAAAAAAAAA=","name":"test-span","startTimeUnixNano":"1000","endTimeUnixNano":"2000","status":{}}]}]}]}`
+
+	logPayload = `{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000","body":{"stringValue":"hello from test"},"severityNumber":9}]}]}]}`
+
+	metricsPayload = `{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"test"}}]},"scopeMetrics":[{"metrics":[{"name":"test.counter","gauge":{"dataPoints":[{"timeUnixNano":"1000","asDouble":42.0}]}}]}]}]}`
+)
+
+func TestForward_Traces(t *testing.T) {
+	c := &mockCounts{}
+	addr := startMockOTLP(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := otlp.Forward(ctx, strings.NewReader(tracePayload+"\n"), addr); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.spans != 1 {
+		t.Errorf("got %d spans, want 1", c.spans)
+	}
+}
+
+func TestForward_Logs(t *testing.T) {
+	c := &mockCounts{}
+	addr := startMockOTLP(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := otlp.Forward(ctx, strings.NewReader(logPayload+"\n"), addr); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.logRecords != 1 {
+		t.Errorf("got %d log records, want 1", c.logRecords)
+	}
+}
+
+func TestForward_Metrics(t *testing.T) {
+	c := &mockCounts{}
+	addr := startMockOTLP(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := otlp.Forward(ctx, strings.NewReader(metricsPayload+"\n"), addr); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.metrics != 1 {
+		t.Errorf("got %d metrics, want 1", c.metrics)
+	}
+}
+
+func TestForward_MixedPayloads(t *testing.T) {
+	c := &mockCounts{}
+	addr := startMockOTLP(t, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
 	input := strings.NewReader(
-		`{"event":"start","ts":1}` + "\n" +
-			`{"event":"end","ts":2}` + "\n",
+		tracePayload + "\n" +
+			logPayload + "\n" +
+			metricsPayload + "\n",
 	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	if err := otlp.Forward(ctx, input, addr); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 
-	// Allow batch processor to flush.
-	time.Sleep(500 * time.Millisecond)
-
-	svc.mu.Lock()
-	total := svc.recordCount
-	svc.mu.Unlock()
-
-	if total != 2 {
-		t.Errorf("got %d log records, want 2", total)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.spans != 1 || c.logRecords != 1 || c.metrics != 1 {
+		t.Errorf("got spans=%d logs=%d metrics=%d, want 1/1/1",
+			c.spans, c.logRecords, c.metrics)
 	}
 }
 
-// mockLogService is a minimal in-process OTLP log collector.
-type mockLogService struct {
-	collectorlogspb.UnimplementedLogsServiceServer
-	mu          sync.Mutex
-	recordCount int
+// mockCounts holds shared counters for all three OTLP services.
+type mockCounts struct {
+	mu         sync.Mutex
+	spans      int
+	logRecords int
+	metrics    int
 }
 
-func (m *mockLogService) Export(_ context.Context, req *collectorlogspb.ExportLogsServiceRequest) (*collectorlogspb.ExportLogsServiceResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, rl := range req.GetResourceLogs() {
-		for _, sl := range rl.GetScopeLogs() {
-			m.recordCount += len(sl.GetLogRecords())
+type mockTraceService struct {
+	collectortracev1.UnimplementedTraceServiceServer
+	c *mockCounts
+}
+
+func (m *mockTraceService) Export(_ context.Context, req *collectortracev1.ExportTraceServiceRequest) (*collectortracev1.ExportTraceServiceResponse, error) {
+	m.c.mu.Lock()
+	defer m.c.mu.Unlock()
+	for _, rs := range req.GetResourceSpans() {
+		for _, ss := range rs.GetScopeSpans() {
+			m.c.spans += len(ss.GetSpans())
 		}
 	}
-	return &collectorlogspb.ExportLogsServiceResponse{}, nil
+	return &collectortracev1.ExportTraceServiceResponse{}, nil
 }
 
-func startMockOTLP(t *testing.T, svc *mockLogService) string {
+type mockLogService struct {
+	collectorlogsv1.UnimplementedLogsServiceServer
+	c *mockCounts
+}
+
+func (m *mockLogService) Export(_ context.Context, req *collectorlogsv1.ExportLogsServiceRequest) (*collectorlogsv1.ExportLogsServiceResponse, error) {
+	m.c.mu.Lock()
+	defer m.c.mu.Unlock()
+	for _, rl := range req.GetResourceLogs() {
+		for _, sl := range rl.GetScopeLogs() {
+			m.c.logRecords += len(sl.GetLogRecords())
+		}
+	}
+	return &collectorlogsv1.ExportLogsServiceResponse{}, nil
+}
+
+type mockMetricsService struct {
+	collectormetricsv1.UnimplementedMetricsServiceServer
+	c *mockCounts
+}
+
+func (m *mockMetricsService) Export(_ context.Context, req *collectormetricsv1.ExportMetricsServiceRequest) (*collectormetricsv1.ExportMetricsServiceResponse, error) {
+	m.c.mu.Lock()
+	defer m.c.mu.Unlock()
+	for _, rm := range req.GetResourceMetrics() {
+		for _, sm := range rm.GetScopeMetrics() {
+			m.c.metrics += len(sm.GetMetrics())
+		}
+	}
+	return &collectormetricsv1.ExportMetricsServiceResponse{}, nil
+}
+
+func startMockOTLP(t *testing.T, c *mockCounts) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
-	collectorlogspb.RegisterLogsServiceServer(srv, svc)
+	collectortracev1.RegisterTraceServiceServer(srv, &mockTraceService{c: c})
+	collectorlogsv1.RegisterLogsServiceServer(srv, &mockLogService{c: c})
+	collectormetricsv1.RegisterMetricsServiceServer(srv, &mockMetricsService{c: c})
 	t.Cleanup(func() { srv.Stop() })
 	go srv.Serve(ln) //nolint:errcheck
 	return ln.Addr().String()

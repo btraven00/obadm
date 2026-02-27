@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -41,6 +42,8 @@ func main() {
 		runRuns(os.Args[2:])
 	case "replay":
 		runReplay(os.Args[2:])
+	case "agent":
+		runAgent(os.Args[2:])
 	case "dashboard":
 		runDashboard(os.Args[2:])
 	case "version":
@@ -67,16 +70,35 @@ func runDashboard(args []string) {
 
 func runStream(args []string) {
 	fs := flag.NewFlagSet("stream", flag.ExitOnError)
-	host := fs.String("host", "", "remote SSH host (required)")
+	remote := fs.String("remote", "", "remote file as [user@]host:path or host@path (e.g. omni:~/telemetry.jsonl)")
+	host := fs.String("host", "", "remote SSH host")
 	user := fs.String("user", "", "SSH user (default: ~/.ssh/config or $USER)")
 	identity := fs.String("identity", "", "path to SSH private key (default: ~/.ssh/config IdentityFile)")
-	remoteFile := fs.String("remote-file", "", "path to telemetry.jsonl on remote (required)")
+	remoteFile := fs.String("remote-file", "", "path to telemetry.jsonl on remote")
 	otlpAddr := fs.String("aspire", "localhost:4317", "local Aspire OTLP gRPC endpoint")
 	agentPath := fs.String("agent-path", defaultAgentPath, "path to obadm-agent on remote")
 	fs.Parse(args) //nolint:errcheck
 
+	// Parse --remote [user@]host:path or host@path if provided.
+	if *remote != "" {
+		u, h, f, ok := parseRemoteSpec(*remote)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error: --remote %q: expected [user@]host:path or host@path\n", *remote)
+			os.Exit(1)
+		}
+		if *host == "" {
+			*host = h
+		}
+		if *user == "" && u != "" {
+			*user = u
+		}
+		if *remoteFile == "" {
+			*remoteFile = f
+		}
+	}
+
 	if *host == "" || *remoteFile == "" {
-		fmt.Fprintln(os.Stderr, "error: --host and --remote-file are required")
+		fmt.Fprintln(os.Stderr, "error: remote host and file are required (use --remote host:path or --host + --remote-file)")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -148,8 +170,10 @@ func runStream(args []string) {
 	}
 
 	log.Printf("streaming %s → %s", *remoteFile, *otlpAddr)
-	if err := otlp.Forward(ctx, tee, *otlpAddr); err != nil {
-		log.Printf("stream ended: %v", err)
+	forwardErr := otlp.Forward(ctx, tee, *otlpAddr)
+	log.Printf("stream ended after %d lines (cache: %s)", run.Lines, run.TelemetryPath())
+	if forwardErr != nil {
+		log.Printf("forward error: %v", forwardErr)
 	}
 
 	if err := run.Finish(); err != nil {
@@ -190,6 +214,52 @@ func runRuns(args []string) {
 	os.Exit(1)
 }
 
+func runAgent(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: obadm agent <subcommand>")
+		fmt.Fprintln(os.Stderr, "subcommands: deploy")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "deploy":
+		runAgentDeploy(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown agent subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func runAgentDeploy(args []string) {
+	fs := flag.NewFlagSet("agent deploy", flag.ExitOnError)
+	host := fs.String("host", "", "remote SSH host (required)")
+	user := fs.String("user", "", "SSH user (default: ~/.ssh/config or $USER)")
+	identity := fs.String("identity", "", "path to SSH private key")
+	agentPath := fs.String("agent-path", defaultAgentPath, "destination path on remote")
+	binary := fs.String("binary", "./obadm-agent", "local obadm-agent binary to upload")
+	fs.Parse(args) //nolint:errcheck
+
+	if *host == "" {
+		fmt.Fprintln(os.Stderr, "error: --host is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg := sshconn.Config{
+		Host:         *host,
+		User:         *user,
+		IdentityFile: *identity,
+		AgentPath:    *agentPath,
+	}
+	log.Printf("deploying %s → %s:%s", *binary, *host, *agentPath)
+	if err := sshconn.Deploy(ctx, cfg, *binary); err != nil {
+		log.Fatalf("deploy: %v", err)
+	}
+	log.Printf("done")
+}
+
 func runReplay(args []string) {
 	fs := flag.NewFlagSet("replay", flag.ExitOnError)
 	otlpAddr := fs.String("aspire", "localhost:4317", "local Aspire OTLP gRPC endpoint")
@@ -219,6 +289,27 @@ func runReplay(args []string) {
 	if err := otlp.Forward(ctx, f, *otlpAddr); err != nil {
 		log.Fatalf("replay: %v", err)
 	}
+}
+
+// parseRemoteSpec parses [user@]host:path or host@path.
+// Returns (user, host, path, ok). user is empty when not specified.
+func parseRemoteSpec(s string) (user, host, filePath string, ok bool) {
+	// [user@]host:path  (standard scp syntax)
+	if i := strings.Index(s, ":"); i > 0 {
+		hostPart := s[:i]
+		filePath = s[i+1:]
+		if j := strings.Index(hostPart, "@"); j >= 0 {
+			user, host = hostPart[:j], hostPart[j+1:]
+		} else {
+			host = hostPart
+		}
+		return user, host, filePath, true
+	}
+	// host@path  (user-friendly alternative)
+	if i := strings.Index(s, "@"); i > 0 {
+		return "", s[:i], s[i+1:], true
+	}
+	return "", "", "", false
 }
 
 // lineCountingWriter wraps an io.Writer and increments *lines on each '\n'.

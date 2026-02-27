@@ -6,31 +6,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"time"
+	"log"
 
-	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
-	"go.opentelemetry.io/otel/log"
-	sdklog "go.opentelemetry.io/otel/sdk/log"
+	collectorlogsv1 "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	collectormetricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	collectortracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricsv1 "go.opentelemetry.io/proto/otlp/metrics/v1"
+	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Forward reads JSONL lines from r and exports each line as an OTLP LogRecord
-// to the gRPC endpoint at addr (e.g. "localhost:4317").
-// Blocks until r returns EOF or an error, or ctx is cancelled.
+// Forward reads OTLP JSON lines from r and forwards each to the appropriate
+// OTLP gRPC service at addr. Each line must be a JSON-serialized OTLP payload
+// with a top-level "resourceSpans", "resourceLogs", or "resourceMetrics" key.
+// Blocks until r returns EOF, an error, or ctx is cancelled.
 func Forward(ctx context.Context, r io.Reader, addr string) error {
-	exp, err := otlploggrpc.New(ctx,
-		otlploggrpc.WithEndpoint(addr),
-		otlploggrpc.WithInsecure(),
-	)
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("create otlp exporter: %w", err)
+		return fmt.Errorf("grpc dial: %w", err)
 	}
+	defer conn.Close()
 
-	provider := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
-	)
-	defer provider.Shutdown(ctx) //nolint:errcheck
+	traceSvc := collectortracev1.NewTraceServiceClient(conn)
+	logSvc := collectorlogsv1.NewLogsServiceClient(conn)
+	metricsSvc := collectormetricsv1.NewMetricsServiceClient(conn)
 
-	logger := provider.Logger("obadm/stream")
+	unmarshaler := protojson.UnmarshalOptions{DiscardUnknown: true}
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -42,32 +46,71 @@ func Forward(ctx context.Context, r io.Reader, addr string) error {
 		default:
 		}
 
-		line := scanner.Text()
-		if line == "" {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			continue
 		}
 
-		var rec log.Record
-		rec.SetTimestamp(time.Now())
-		rec.SetObservedTimestamp(time.Now())
-		rec.SetSeverity(log.SeverityInfo)
-		rec.SetBody(log.StringValue(line))
-
-		// Extract fields from JSON and attach as attributes.
-		var m map[string]any
-		if err := json.Unmarshal([]byte(line), &m); err == nil {
-			attrs := make([]log.KeyValue, 0, len(m))
-			for k, v := range m {
-				attrs = append(attrs, log.String(k, fmt.Sprintf("%v", v)))
-			}
-			rec.AddAttributes(attrs...)
+		if err := dispatchLine(ctx, line, unmarshaler, traceSvc, logSvc, metricsSvc); err != nil {
+			log.Printf("otlp: %v", err)
 		}
-
-		logger.Emit(ctx, rec)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("read: %w", err)
+	return scanner.Err()
+}
+
+// peek is used to identify the payload type from the top-level JSON key.
+type peek struct {
+	ResourceSpans   json.RawMessage `json:"resourceSpans"`
+	ResourceLogs    json.RawMessage `json:"resourceLogs"`
+	ResourceMetrics json.RawMessage `json:"resourceMetrics"`
+}
+
+func dispatchLine(
+	ctx context.Context,
+	line []byte,
+	u protojson.UnmarshalOptions,
+	traceSvc collectortracev1.TraceServiceClient,
+	logSvc collectorlogsv1.LogsServiceClient,
+	metricsSvc collectormetricsv1.MetricsServiceClient,
+) error {
+	var p peek
+	if err := json.Unmarshal(line, &p); err != nil {
+		return fmt.Errorf("json peek: %w", err)
 	}
-	return nil
+
+	switch {
+	case p.ResourceSpans != nil:
+		var td tracev1.TracesData
+		if err := u.Unmarshal(line, &td); err != nil {
+			return fmt.Errorf("unmarshal traces: %w", err)
+		}
+		_, err := traceSvc.Export(ctx, &collectortracev1.ExportTraceServiceRequest{
+			ResourceSpans: td.ResourceSpans,
+		})
+		return err
+
+	case p.ResourceLogs != nil:
+		var ld logsv1.LogsData
+		if err := u.Unmarshal(line, &ld); err != nil {
+			return fmt.Errorf("unmarshal logs: %w", err)
+		}
+		_, err := logSvc.Export(ctx, &collectorlogsv1.ExportLogsServiceRequest{
+			ResourceLogs: ld.ResourceLogs,
+		})
+		return err
+
+	case p.ResourceMetrics != nil:
+		var md metricsv1.MetricsData
+		if err := u.Unmarshal(line, &md); err != nil {
+			return fmt.Errorf("unmarshal metrics: %w", err)
+		}
+		_, err := metricsSvc.Export(ctx, &collectormetricsv1.ExportMetricsServiceRequest{
+			ResourceMetrics: md.ResourceMetrics,
+		})
+		return err
+
+	default:
+		return fmt.Errorf("unrecognized payload (no resourceSpans/resourceLogs/resourceMetrics)")
+	}
 }

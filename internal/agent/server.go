@@ -51,10 +51,25 @@ func handleConn(ctx context.Context, conn net.Conn, filePath string) {
 		return
 	}
 
-	f, err := os.Open(filePath)
-	if err != nil {
-		log.Printf("agent: open %s: %v", filePath, err)
-		return
+	// Wait for the file to appear — it may not exist yet if the benchmark
+	// hasn't started writing.
+	var f *os.File
+	for {
+		var err error
+		f, err = os.Open(filePath)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) {
+			log.Printf("agent: open %s: %v", filePath, err)
+			return
+		}
+		log.Printf("agent: waiting for %s...", filePath)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	defer f.Close()
 
