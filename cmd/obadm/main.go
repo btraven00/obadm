@@ -8,8 +8,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"syscall"
+	"runtime/debug"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/btraven00/obadm/internal/cache"
 	"github.com/btraven00/obadm/internal/otlp"
 	"github.com/btraven00/obadm/internal/sshconn"
+	"github.com/psanford/wormhole-william/wormhole"
 )
 
 // Set by -ldflags at build time.
@@ -28,10 +30,38 @@ var (
 
 const defaultAgentPath = "~/.obadm/bin/obadm-agent"
 
+func buildVersion() string {
+	v, c, d := version, commit, date
+	// Fall back to VCS info embedded by the Go toolchain at build time.
+	if v == "dev" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			if info.Main.Version != "" && info.Main.Version != "(devel)" {
+				v = info.Main.Version
+			}
+			for _, s := range info.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					c = s.Value
+					if len(c) > 12 {
+						c = c[:12]
+					}
+				case "vcs.time":
+					d = s.Value
+				case "vcs.modified":
+					if s.Value == "true" {
+						c += "-dirty"
+					}
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("obadm %s (commit %s, built %s)", v, c, d)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: obadm <command> [flags]")
-		fmt.Fprintln(os.Stderr, "commands: stream, runs, replay, dashboard, version")
+		fmt.Fprintln(os.Stderr, "commands: stream, runs, replay, share, receive, agent, dashboard, version")
 		os.Exit(1)
 	}
 
@@ -42,12 +72,16 @@ func main() {
 		runRuns(os.Args[2:])
 	case "replay":
 		runReplay(os.Args[2:])
+	case "share":
+		runShare(os.Args[2:])
+	case "receive":
+		runReceive(os.Args[2:])
 	case "agent":
 		runAgent(os.Args[2:])
 	case "dashboard":
 		runDashboard(os.Args[2:])
 	case "version":
-		fmt.Printf("obadm %s (commit %s, built %s)\n", version, commit, date)
+		fmt.Println(buildVersion())
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -289,6 +323,85 @@ func runReplay(args []string) {
 	if err := otlp.Forward(ctx, f, *otlpAddr); err != nil {
 		log.Fatalf("replay: %v", err)
 	}
+}
+
+func runShare(args []string) {
+	fs := flag.NewFlagSet("share", flag.ExitOnError)
+	fs.Parse(args) //nolint:errcheck
+
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "usage: obadm share <run-id>")
+		os.Exit(1)
+	}
+
+	run, err := cache.Get(fs.Arg(0))
+	if err != nil {
+		log.Fatalf("get run: %v", err)
+	}
+
+	f, err := os.Open(run.TelemetryPath())
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	c := wormhole.Client{}
+	code, status, err := c.SendFile(ctx, "telemetry.jsonl", f)
+	if err != nil {
+		log.Fatalf("share: %v", err)
+	}
+	fmt.Printf("wormhole code: %s\n", code)
+	log.Printf("waiting for receiver...")
+
+	s := <-status
+	if s.Error != nil {
+		log.Fatalf("share error: %v", s.Error)
+	}
+	log.Printf("done: run %s transferred", run.ID[:8])
+}
+
+func runReceive(args []string) {
+	fs := flag.NewFlagSet("receive", flag.ExitOnError)
+	fs.Parse(args) //nolint:errcheck
+
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "usage: obadm receive <wormhole-code>")
+		os.Exit(1)
+	}
+	code := fs.Arg(0)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	c := wormhole.Client{}
+	msg, err := c.Receive(ctx, code)
+	if err != nil {
+		log.Fatalf("receive: %v", err)
+	}
+
+	run, err := cache.New("wormhole", code)
+	if err != nil {
+		log.Fatalf("new run: %v", err)
+	}
+
+	w, err := run.Writer()
+	if err != nil {
+		log.Fatalf("open writer: %v", err)
+	}
+	defer w.Close()
+
+	log.Printf("receiving %s (%d bytes) → run %s", msg.Name, msg.TransferBytes64, run.ID[:8])
+	if _, err := io.Copy(w, msg); err != nil {
+		log.Fatalf("receive: %v", err)
+	}
+
+	if err := run.Finish(); err != nil {
+		log.Printf("finish: %v", err)
+	}
+	log.Printf("replay with: obadm replay %s", run.ID[:8])
 }
 
 // parseRemoteSpec parses [user@]host:path or host@path.
