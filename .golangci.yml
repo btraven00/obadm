@@ -1,0 +1,21 @@
+linters:
+  enable:
+    - govet        # go vet (also run standalone above for fast feedback)
+    - staticcheck  # SA/S/QF checks from staticcheck.io
+    - errcheck     # unchecked errors
+    - gosimple     # simplification suggestions
+    - unused       # unused code
+    - ineffassign  # assignments with no effect
+    - typecheck    # compilation errors
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (io.Closer).Close
+      - (*bufio.Writer).Flush
+
+issues:
+  exclude-rules:
+    # Test files: relax errcheck (lots of intentional fire-and-forget).
+    - path: "_test\\.go"
+      linters: [errcheck]

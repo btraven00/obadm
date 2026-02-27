@@ -1,0 +1,98 @@
+name: Nightly Release
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false  # golangci-lint manages its own cache
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race -count=1 ./...
+
+  release:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: "0"
+          LDFLAGS: >-
+            -X main.version=nightly
+            -X main.commit=${{ github.sha }}
+            -X main.date=${{ github.run_started_at }}
+        run: |
+          for GOOS in linux darwin; do
+            for GOARCH in amd64 arm64; do
+              GOOS=$GOOS GOARCH=$GOARCH \
+                go build -trimpath -ldflags "$LDFLAGS" \
+                -o obadm_${GOOS}_${GOARCH} ./cmd/obadm
+            done
+          done
+
+          # Agent is deployed to remote Linux hosts only.
+          for GOARCH in amd64 arm64; do
+            GOOS=linux GOARCH=$GOARCH \
+              go build -trimpath -ldflags "$LDFLAGS" \
+              -o obadm-agent_linux_${GOARCH} ./cmd/obadm-agent
+          done
+
+      - name: Checksums
+        run: sha256sum obadm_* obadm-agent_* > checksums.txt
+
+      - name: Update nightly tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push origin nightly --force
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          body: |
+            Automated nightly build.
+
+            **Commit:** `${{ github.sha }}`
+            **Date:** ${{ github.run_started_at }}
+
+            > This release is overwritten every night. For stable builds, use a tagged release.
+          prerelease: true
+          make_latest: false
+          files: |
+            obadm_*
+            obadm-agent_*
+            checksums.txt
