@@ -1,6 +1,6 @@
 # obadm
 
-Admin utilities for omnibenchmark.
+Admin tools for nicer benchmarking.
 
 ## Quick start
 
