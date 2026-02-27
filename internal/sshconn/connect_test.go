@@ -71,6 +71,11 @@ func TestConnect_StreamsViaSSH(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// Send resume handshake before reading — agent now requires it.
+	if _, err := fmt.Fprintf(conn, `{"resume_line":0}`+"\n"); err != nil {
+		t.Fatalf("send resume handshake: %v", err)
+	}
+
 	type deadliner interface{ SetDeadline(time.Time) error }
 	if dl, ok := conn.(deadliner); ok {
 		dl.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck

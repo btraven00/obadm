@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/gliderlabs/ssh v0.3.8
+	github.com/google/uuid v1.6.0
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/pkg/sftp v1.13.10
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.16.0
@@ -20,7 +21,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.7 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

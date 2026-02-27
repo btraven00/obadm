@@ -85,7 +85,8 @@ type Conn struct {
 	session   *gossh.Session
 }
 
-func (c *Conn) Read(p []byte) (int, error) { return c.tunnel.Read(p) }
+func (c *Conn) Read(p []byte) (int, error)  { return c.tunnel.Read(p) }
+func (c *Conn) Write(p []byte) (int, error) { return c.tunnel.Write(p) }
 
 func (c *Conn) Close() error {
 	c.tunnel.Close()
@@ -95,8 +96,9 @@ func (c *Conn) Close() error {
 
 // Connect dials the remote SSH server, execs obadm-agent, sets up a local
 // port forward, and returns a Conn whose Read yields raw JSONL lines.
+// The caller must write the resume handshake ({"resume_line":N}) before reading.
 // Empty fields in cfg are resolved from ~/.ssh/config before connecting.
-func Connect(ctx context.Context, cfg Config) (io.ReadCloser, error) {
+func Connect(ctx context.Context, cfg Config) (io.ReadWriteCloser, error) {
 	resolveConfig(&cfg)
 
 	if cfg.IdentityFile == "" {

@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net"
@@ -12,8 +13,14 @@ import (
 	"os"
 )
 
+// resumeMsg is the handshake the client sends before the agent starts streaming.
+type resumeMsg struct {
+	ResumeLine int64 `json:"resume_line"`
+}
+
 // Serve accepts connections on ln and streams lines from filePath to each client.
-// Reads from the beginning of the file and follows new content as it is written.
+// Each client must first send {"resume_line": N}; the agent skips N lines then
+// streams from line N+1 onward, following new content as it is written.
 func Serve(ctx context.Context, filePath string, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
@@ -37,6 +44,13 @@ func Serve(ctx context.Context, filePath string, ln net.Listener) error {
 func handleConn(ctx context.Context, conn net.Conn, filePath string) {
 	defer conn.Close()
 
+	// Read the resume handshake from the client.
+	var msg resumeMsg
+	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+		log.Printf("agent: read resume msg: %v", err)
+		return
+	}
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("agent: open %s: %v", filePath, err)
@@ -46,6 +60,22 @@ func handleConn(ctx context.Context, conn net.Conn, filePath string) {
 
 	w := bufio.NewWriter(conn)
 	r := bufio.NewReader(f)
+
+	// Skip msg.ResumeLine complete lines.
+	var skipped int64
+	for skipped < msg.ResumeLine {
+		_, err := r.ReadString('\n')
+		if err == io.EOF {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			log.Printf("agent: skip line: %v", err)
+			return
+		}
+		skipped++
+	}
+
 	var pending strings.Builder
 
 	for {
