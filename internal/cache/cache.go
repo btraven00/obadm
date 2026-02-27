@@ -42,6 +42,11 @@ func (r *Run) Writer() (*os.File, error) {
 	return os.OpenFile(r.TelemetryPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 }
 
+// Remove deletes the run directory entirely. Used to clean up on failed receives.
+func (r *Run) Remove() error {
+	return os.RemoveAll(r.dir)
+}
+
 // Finish writes finished_at to meta.json.
 func (r *Run) Finish() error {
 	now := time.Now()

@@ -104,36 +104,19 @@ func runDashboard(args []string) {
 
 func runStream(args []string) {
 	fs := flag.NewFlagSet("stream", flag.ExitOnError)
-	remote := fs.String("remote", "", "remote file as [user@]host:path or host@path (e.g. omni:~/telemetry.jsonl)")
-	host := fs.String("host", "", "remote SSH host")
-	user := fs.String("user", "", "SSH user (default: ~/.ssh/config or $USER)")
 	identity := fs.String("identity", "", "path to SSH private key (default: ~/.ssh/config IdentityFile)")
-	remoteFile := fs.String("remote-file", "", "path to telemetry.jsonl on remote")
 	otlpAddr := fs.String("aspire", "localhost:4317", "local Aspire OTLP gRPC endpoint")
 	agentPath := fs.String("agent-path", defaultAgentPath, "path to obadm-agent on remote")
 	fs.Parse(args) //nolint:errcheck
 
-	// Parse --remote [user@]host:path or host@path if provided.
-	if *remote != "" {
-		u, h, f, ok := parseRemoteSpec(*remote)
-		if !ok {
-			fmt.Fprintf(os.Stderr, "error: --remote %q: expected [user@]host:path or host@path\n", *remote)
-			os.Exit(1)
-		}
-		if *host == "" {
-			*host = h
-		}
-		if *user == "" && u != "" {
-			*user = u
-		}
-		if *remoteFile == "" {
-			*remoteFile = f
-		}
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "usage: obadm stream [--identity key] [--aspire addr] [user@]host:path")
+		os.Exit(1)
 	}
 
-	if *host == "" || *remoteFile == "" {
-		fmt.Fprintln(os.Stderr, "error: remote host and file are required (use --remote host:path or --host + --remote-file)")
-		fs.Usage()
+	user, host, remoteFile, ok := parseRemoteSpec(fs.Arg(0))
+	if !ok {
+		fmt.Fprintf(os.Stderr, "error: %q: expected [user@]host:path\n", fs.Arg(0))
 		os.Exit(1)
 	}
 
@@ -145,10 +128,10 @@ func runStream(args []string) {
 	}
 
 	// Determine run: resume existing or start fresh.
-	run, err := cache.Resume(*host, *remoteFile)
+	run, err := cache.Resume(host, remoteFile)
 	var resumeLine int64
 	if err != nil {
-		run, err = cache.New(*host, *remoteFile)
+		run, err = cache.New(host, remoteFile)
 		if err != nil {
 			log.Fatalf("cache new: %v", err)
 		}
@@ -159,10 +142,10 @@ func runStream(args []string) {
 	}
 
 	cfg := sshconn.Config{
-		Host:         *host,
-		User:         *user,
+		Host:         host,
+		User:         user,
 		IdentityFile: *identity,
-		RemoteFile:   *remoteFile,
+		RemoteFile:   remoteFile,
 		AgentPath:    *agentPath,
 	}
 
@@ -203,7 +186,7 @@ func runStream(args []string) {
 		cached.Close()
 	}
 
-	log.Printf("streaming %s → %s", *remoteFile, *otlpAddr)
+	log.Printf("streaming %s → %s", remoteFile, *otlpAddr)
 	forwardErr := otlp.Forward(ctx, tee, *otlpAddr)
 	log.Printf("stream ended after %d lines (cache: %s)", run.Lines, run.TelemetryPath())
 	if forwardErr != nil {
@@ -265,29 +248,28 @@ func runAgent(args []string) {
 
 func runAgentDeploy(args []string) {
 	fs := flag.NewFlagSet("agent deploy", flag.ExitOnError)
-	host := fs.String("host", "", "remote SSH host (required)")
-	user := fs.String("user", "", "SSH user (default: ~/.ssh/config or $USER)")
 	identity := fs.String("identity", "", "path to SSH private key")
 	agentPath := fs.String("agent-path", defaultAgentPath, "destination path on remote")
 	binary := fs.String("binary", "./obadm-agent", "local obadm-agent binary to upload")
 	fs.Parse(args) //nolint:errcheck
 
-	if *host == "" {
-		fmt.Fprintln(os.Stderr, "error: --host is required")
-		fs.Usage()
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "usage: obadm agent deploy [--identity key] [--binary path] [user@]host")
 		os.Exit(1)
 	}
+
+	user, host := parseHostSpec(fs.Arg(0))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cfg := sshconn.Config{
-		Host:         *host,
-		User:         *user,
+		Host:         host,
+		User:         user,
 		IdentityFile: *identity,
 		AgentPath:    *agentPath,
 	}
-	log.Printf("deploying %s → %s:%s", *binary, *host, *agentPath)
+	log.Printf("deploying %s → %s:%s", *binary, host, *agentPath)
 	if err := sshconn.Deploy(ctx, cfg, *binary); err != nil {
 		log.Fatalf("deploy: %v", err)
 	}
@@ -349,11 +331,11 @@ func runShare(args []string) {
 	defer stop()
 
 	c := wormhole.Client{}
-	code, status, err := c.SendFile(ctx, "telemetry.jsonl", f)
+	code, status, err := c.SendFile(ctx, run.ID+".jsonl", f)
 	if err != nil {
 		log.Fatalf("share: %v", err)
 	}
-	fmt.Printf("wormhole code: %s\n", code)
+	fmt.Printf("share code: %s\n", code)
 	log.Printf("waiting for receiver...")
 
 	s := <-status
@@ -382,20 +364,33 @@ func runReceive(args []string) {
 		log.Fatalf("receive: %v", err)
 	}
 
-	run, err := cache.New("wormhole", code)
+	// If the sender embedded a run ID in the filename (<uuid>.jsonl), check
+	// whether we already have that run before creating a duplicate entry.
+	if srcID := strings.TrimSuffix(msg.Name, ".jsonl"); srcID != msg.Name {
+		if existing, err := cache.Get(srcID); err == nil {
+			msg.Reject() //nolint:errcheck — signal rejection so the sender is not left hanging
+			log.Fatalf("run %s is already in cache; use: obadm replay %s", existing.ID[:8], existing.ID[:8])
+		}
+	}
+
+	run, err := cache.New("shared", code)
 	if err != nil {
 		log.Fatalf("new run: %v", err)
 	}
 
 	w, err := run.Writer()
 	if err != nil {
+		run.Remove() //nolint:errcheck
 		log.Fatalf("open writer: %v", err)
 	}
-	defer w.Close()
 
 	log.Printf("receiving %s (%d bytes) → run %s", msg.Name, msg.TransferBytes64, run.ID[:8])
-	if _, err := io.Copy(w, msg); err != nil {
-		log.Fatalf("receive: %v", err)
+	lcw := &lineCountingWriter{w: w, lines: &run.Lines}
+	_, copyErr := io.Copy(lcw, msg)
+	w.Close()
+	if copyErr != nil {
+		run.Remove() //nolint:errcheck
+		log.Fatalf("receive: %v", copyErr)
 	}
 
 	if err := run.Finish(); err != nil {
@@ -404,25 +399,30 @@ func runReceive(args []string) {
 	log.Printf("replay with: obadm replay %s", run.ID[:8])
 }
 
-// parseRemoteSpec parses [user@]host:path or host@path.
+// parseRemoteSpec parses [user@]host:path (scp syntax).
 // Returns (user, host, path, ok). user is empty when not specified.
 func parseRemoteSpec(s string) (user, host, filePath string, ok bool) {
-	// [user@]host:path  (standard scp syntax)
-	if i := strings.Index(s, ":"); i > 0 {
-		hostPart := s[:i]
-		filePath = s[i+1:]
-		if j := strings.Index(hostPart, "@"); j >= 0 {
-			user, host = hostPart[:j], hostPart[j+1:]
-		} else {
-			host = hostPart
-		}
-		return user, host, filePath, true
+	i := strings.Index(s, ":")
+	if i <= 0 {
+		return "", "", "", false
 	}
-	// host@path  (user-friendly alternative)
-	if i := strings.Index(s, "@"); i > 0 {
-		return "", s[:i], s[i+1:], true
+	hostPart := s[:i]
+	filePath = s[i+1:]
+	if j := strings.Index(hostPart, "@"); j >= 0 {
+		user, host = hostPart[:j], hostPart[j+1:]
+	} else {
+		host = hostPart
 	}
-	return "", "", "", false
+	return user, host, filePath, true
+}
+
+// parseHostSpec parses [user@]host.
+// Returns (user, host). user is empty when not specified.
+func parseHostSpec(s string) (user, host string) {
+	if u, h, ok := strings.Cut(s, "@"); ok {
+		return u, h
+	}
+	return "", s
 }
 
 // lineCountingWriter wraps an io.Writer and increments *lines on each '\n'.
