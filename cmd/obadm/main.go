@@ -368,7 +368,7 @@ func runReceive(args []string) {
 	// whether we already have that run before creating a duplicate entry.
 	if srcID := strings.TrimSuffix(msg.Name, ".jsonl"); srcID != msg.Name {
 		if existing, err := cache.Get(srcID); err == nil {
-			msg.Reject() //nolint:errcheck — signal rejection so the sender is not left hanging
+			msg.Reject() //nolint:errcheck // signal rejection so the sender is not left hanging
 			log.Fatalf("run %s is already in cache; use: obadm replay %s", existing.ID[:8], existing.ID[:8])
 		}
 	}
