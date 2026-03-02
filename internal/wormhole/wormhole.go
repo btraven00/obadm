@@ -21,9 +21,18 @@ type Config struct {
 	TransitRelayAddress string
 }
 
+// DefaultRendezvousURL is the TLS endpoint for the public magic-wormhole
+// mailbox server. The library's own default uses plain ws:// on port 4000
+// which is often blocked by firewalls; this uses wss:// on 443.
+const DefaultRendezvousURL = "wss://relay.magic-wormhole.io/v1"
+
 func newClient(cfg Config) ww.Client {
+	url := cfg.RendezvousURL
+	if url == "" {
+		url = DefaultRendezvousURL
+	}
 	return ww.Client{
-		RendezvousURL:       cfg.RendezvousURL,
+		RendezvousURL:       url,
 		TransitRelayAddress: cfg.TransitRelayAddress,
 	}
 }
@@ -78,12 +87,7 @@ func (e *DuplicateRunError) Error() string {
 // responsive.
 func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	c := newClient(cfg)
-
-	rendURL := cfg.RendezvousURL
-	if rendURL == "" {
-		rendURL = ww.DefaultRendezvousURL
-	}
-	log.Printf("connecting to rendezvous: %s", rendURL)
+	log.Printf("connecting to rendezvous: %s", c.RendezvousURL)
 
 	// --- phase 1: rendezvous + offer exchange ---
 	type offerResult struct {
