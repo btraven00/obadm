@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"sync/atomic"
 
 	gorilla "github.com/gorilla/websocket"
 )
@@ -45,9 +46,13 @@ func Dial(ctx context.Context, urlStr string, opts *DialOptions) (*Conn, *http.R
 	return &Conn{gc: gc}, resp, nil
 }
 
+var readCount int32
+
 // Read reads a single message from the connection. It returns when a message
 // arrives or ctx is cancelled (closing the underlying connection on cancel).
 func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
+	n := atomic.AddInt32(&readCount, 1)
+	log.Printf("wshim: Read #%d waiting", n)
 	type result struct {
 		mt  int
 		msg []byte
@@ -60,6 +65,7 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 	}()
 	select {
 	case r := <-ch:
+		log.Printf("wshim: Read #%d got mt=%d len=%d err=%v", n, r.mt, len(r.msg), r.err)
 		return MessageType(r.mt), r.msg, r.err
 	case <-ctx.Done():
 		c.gc.Close()
@@ -69,7 +75,10 @@ func (c *Conn) Read(ctx context.Context) (MessageType, []byte, error) {
 
 // WriteJSON sends v as a JSON text message.
 func (c *Conn) WriteJSON(v interface{}) error {
-	return c.gc.WriteJSON(v)
+	log.Printf("wshim: WriteJSON %T", v)
+	err := c.gc.WriteJSON(v)
+	log.Printf("wshim: WriteJSON done err=%v", err)
+	return err
 }
 
 // Close sends a WebSocket close frame and closes the connection.
