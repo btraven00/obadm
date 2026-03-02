@@ -5,7 +5,7 @@ Admin tools for nicer benchmarking.
 ## Install
 
 ```sh
-curl -fsSL "https://github.com/btraven00/obadm/releases/latest/download/obadm_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" -o obadm && chmod +x obadm
+curl -fsSL https://raw.githubusercontent.com/btraven00/obadm/main/install.sh | sh
 ```
 
 See [INSTALL.md](INSTALL.md) for other installation methods.
