@@ -28,6 +28,14 @@ add_to_path() {
     return
   fi
 
+  # When piped (curl | sh) the shell's stdin is the pipe, not the terminal.
+  # exec < /dev/tty rewires it so read gets keystrokes.
+  [ -t 0 ] || exec < /dev/tty || {
+    echo "No terminal available. Add to $RC manually:"
+    echo "  $LINE"
+    return
+  }
+
   printf 'Add %s to PATH in %s? [y/N] ' '$HOME/.obadm/bin' "$RC"
   read -r REPLY
   case "$REPLY" in
