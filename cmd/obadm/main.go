@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ import (
 	"github.com/btraven00/obadm/internal/cache"
 	"github.com/btraven00/obadm/internal/otlp"
 	"github.com/btraven00/obadm/internal/sshconn"
-	"github.com/psanford/wormhole-william/wormhole"
+	obwormhole "github.com/btraven00/obadm/internal/wormhole"
 )
 
 // Set by -ldflags at build time.
@@ -325,26 +326,14 @@ func runShare(args []string) {
 		log.Fatalf("get run: %v", err)
 	}
 
-	f, err := os.Open(run.TelemetryPath())
-	if err != nil {
-		log.Fatalf("open: %v", err)
-	}
-	defer f.Close()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	c := wormhole.Client{}
-	code, status, err := c.SendFile(ctx, run.ID+".jsonl", f)
-	if err != nil {
+	if err := obwormhole.Share(ctx, run, obwormhole.Config{}, func(code string) {
+		fmt.Printf("share code: %s\n", code)
+		log.Printf("waiting for receiver...")
+	}); err != nil {
 		log.Fatalf("share: %v", err)
-	}
-	fmt.Printf("share code: %s\n", code)
-	log.Printf("waiting for receiver...")
-
-	s := <-status
-	if s.Error != nil {
-		log.Fatalf("share error: %v", s.Error)
 	}
 	log.Printf("done: run %s transferred", run.ID[:8])
 }
@@ -362,44 +351,15 @@ func runReceive(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	c := wormhole.Client{}
-	msg, err := c.Receive(ctx, code)
+	run, err := obwormhole.Receive(ctx, code, obwormhole.Config{})
 	if err != nil {
+		var dupErr *obwormhole.DuplicateRunError
+		if errors.As(err, &dupErr) {
+			log.Fatalf("run %s already in cache; use: obadm replay %s", dupErr.Run.ID[:8], dupErr.Run.ID[:8])
+		}
 		log.Fatalf("receive: %v", err)
 	}
-
-	// If the sender embedded a run ID in the filename (<uuid>.jsonl), check
-	// whether we already have that run before creating a duplicate entry.
-	if srcID := strings.TrimSuffix(msg.Name, ".jsonl"); srcID != msg.Name {
-		if existing, err := cache.Get(srcID); err == nil {
-			msg.Reject() //nolint:errcheck // signal rejection so the sender is not left hanging
-			log.Fatalf("run %s is already in cache; use: obadm replay %s", existing.ID[:8], existing.ID[:8])
-		}
-	}
-
-	run, err := cache.New("shared", code)
-	if err != nil {
-		log.Fatalf("new run: %v", err)
-	}
-
-	w, err := run.Writer()
-	if err != nil {
-		run.Remove() //nolint:errcheck
-		log.Fatalf("open writer: %v", err)
-	}
-
-	log.Printf("receiving %s (%d bytes) → run %s", msg.Name, msg.TransferBytes64, run.ID[:8])
-	lcw := &lineCountingWriter{w: w, lines: &run.Lines}
-	_, copyErr := io.Copy(lcw, msg)
-	w.Close()
-	if copyErr != nil {
-		run.Remove() //nolint:errcheck
-		log.Fatalf("receive: %v", copyErr)
-	}
-
-	if err := run.Finish(); err != nil {
-		log.Printf("finish: %v", err)
-	}
+	log.Printf("received %d lines → run %s", run.Lines, run.ID[:8])
 	log.Printf("replay with: obadm replay %s", run.ID[:8])
 }
 
