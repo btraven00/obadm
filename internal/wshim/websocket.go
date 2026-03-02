@@ -5,6 +5,7 @@ package websocket
 
 import (
 	"context"
+	"log"
 	"net/http"
 
 	gorilla "github.com/gorilla/websocket"
@@ -34,10 +35,13 @@ type Conn struct {
 // Dial opens a WebSocket connection to urlStr. opts is ignored (always nil from
 // wormhole-william).
 func Dial(ctx context.Context, urlStr string, opts *DialOptions) (*Conn, *http.Response, error) {
+	log.Printf("wshim: dialing %s", urlStr)
 	gc, resp, err := gorilla.DefaultDialer.DialContext(ctx, urlStr, nil)
 	if err != nil {
+		log.Printf("wshim: dial error: %v", err)
 		return nil, resp, err
 	}
+	log.Printf("wshim: connected")
 	return &Conn{gc: gc}, resp, nil
 }
 
