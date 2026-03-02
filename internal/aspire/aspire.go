@@ -96,8 +96,12 @@ func startDetached(ctx context.Context, runtime string, mounts []string) error {
 	}
 	args = append(args, image)
 
-	out, err := exec.CommandContext(ctx, runtime, args...).Output()
+	log.Printf("aspire: running: %s %s", runtime, strings.Join(args, " "))
+	out, err := exec.CommandContext(ctx, runtime, args...).CombinedOutput()
 	if err != nil {
+		if len(out) > 0 {
+			return fmt.Errorf("%w\n%s", err, strings.TrimSpace(string(out)))
+		}
 		return err
 	}
 	log.Printf("aspire: container started (%s)", strings.TrimSpace(string(out)))
@@ -162,8 +166,12 @@ func ensureBrandingAssets(ctx context.Context, runtime string) ([]string, error)
 	}
 
 	// Spin up one temp container for all copies.
-	idBytes, err := exec.CommandContext(ctx, runtime, "create", image).Output()
+	idBytes, err := exec.CommandContext(ctx, runtime, "create", image).CombinedOutput()
 	if err != nil {
+		msg := strings.TrimSpace(string(idBytes))
+		if msg != "" {
+			return nil, fmt.Errorf("create temp container: %w\n%s", err, msg)
+		}
 		return nil, fmt.Errorf("create temp container: %w", err)
 	}
 	containerID := strings.TrimSpace(string(idBytes))
@@ -199,9 +207,13 @@ func ensureBrandingAssets(ctx context.Context, runtime string) ([]string, error)
 }
 
 func copyAndAppend(ctx context.Context, runtime, containerID, srcPath, dest, appendContent string) error {
-	if err := exec.CommandContext(ctx, runtime, "cp",
+	if out, err := exec.CommandContext(ctx, runtime, "cp",
 		containerID+":"+srcPath, dest,
-	).Run(); err != nil {
+	).CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("copy %s: %w\n%s", srcPath, err, msg)
+		}
 		return fmt.Errorf("copy %s: %w", srcPath, err)
 	}
 	f, err := os.OpenFile(dest, os.O_APPEND|os.O_WRONLY, 0o644)
