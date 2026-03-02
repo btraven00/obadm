@@ -66,14 +66,13 @@ func TestShareReceive(t *testing.T) {
 	senderCache := t.TempDir()
 	receiverCache := t.TempDir()
 
-	os.Setenv("XDG_CACHE_HOME", senderCache) //nolint:errcheck
-
+	// Create source run in the sender's isolated cache.
+	t.Setenv("XDG_CACHE_HOME", senderCache)
 	const content = `{"type":"log","msg":"hello"}` + "\n" + `{"type":"log","msg":"world"}` + "\n"
 	srcRun := makeSrcRun(t, content)
 
-	// Switch to the receiver's cache before starting the transfer.
-	os.Setenv("XDG_CACHE_HOME", receiverCache) //nolint:errcheck
-	t.Cleanup(func() { os.Unsetenv("XDG_CACHE_HOME") }) //nolint:errcheck
+	// Switch to the receiver's isolated cache before starting the transfer.
+	t.Setenv("XDG_CACHE_HOME", receiverCache)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

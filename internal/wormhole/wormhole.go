@@ -66,18 +66,43 @@ func (e *DuplicateRunError) Error() string {
 // Receive downloads a telemetry run via wormhole code and stores it in the
 // cache. Returns the new Run on success. Returns *DuplicateRunError if the
 // run is already cached.
+//
+// The wormhole-william rendezvous client has internal goroutines that do not
+// honour context cancellation (they block on unbuffered channel receives with
+// no ctx.Done() branch). We work around this by running each blocking library
+// call in a goroutine and selecting on ctx.Done(), so Ctrl-C is always
+// responsive.
 func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	c := newClient(cfg)
-	msg, err := c.Receive(ctx, code)
-	if err != nil {
-		return nil, fmt.Errorf("receive: %w", err)
+
+	log.Printf("connecting to wormhole rendezvous...")
+
+	// --- phase 1: rendezvous + offer exchange ---
+	type offerResult struct {
+		msg *ww.IncomingMessage
+		err error
+	}
+	offerCh := make(chan offerResult, 1)
+	go func() {
+		msg, err := c.Receive(ctx, code)
+		offerCh <- offerResult{msg, err}
+	}()
+
+	var msg *ww.IncomingMessage
+	select {
+	case r := <-offerCh:
+		if r.err != nil {
+			return nil, fmt.Errorf("wormhole: %w", r.err)
+		}
+		msg = r.msg
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 
-	// If the sender embedded a run ID in the filename (<uuid>.jsonl), check
-	// for a duplicate before creating a new cache entry.
+	// Duplicate check: reject if the sender's run is already cached locally.
 	if srcID := strings.TrimSuffix(msg.Name, ".jsonl"); srcID != msg.Name {
 		if existing, err := cache.Get(srcID); err == nil {
-			msg.Reject() //nolint:errcheck // tell sender we're not accepting
+			msg.Reject() //nolint:errcheck
 			return nil, &DuplicateRunError{Run: existing}
 		}
 	}
@@ -94,8 +119,29 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	}
 
 	log.Printf("receiving %s (%d bytes) → run %s", msg.Name, msg.TransferBytes64, run.ID[:8])
+
+	// --- phase 2: transit + data copy ---
+	// io.Copy blocks in the transit layer (io.ReadFull with no context).
+	type copyResult struct {
+		err error
+	}
 	lcw := &lineCountWriter{w: w, lines: &run.Lines}
-	_, copyErr := io.Copy(lcw, msg)
+	copyCh := make(chan copyResult, 1)
+	go func() {
+		_, err := io.Copy(lcw, msg)
+		copyCh <- copyResult{err}
+	}()
+
+	var copyErr error
+	select {
+	case r := <-copyCh:
+		copyErr = r.err
+	case <-ctx.Done():
+		w.Close()
+		run.Remove() //nolint:errcheck
+		return nil, ctx.Err()
+	}
+
 	w.Close()
 	if copyErr != nil {
 		run.Remove() //nolint:errcheck
