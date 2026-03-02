@@ -79,7 +79,11 @@ func (e *DuplicateRunError) Error() string {
 func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	c := newClient(cfg)
 
-	log.Printf("connecting to wormhole rendezvous...")
+	rendURL := cfg.RendezvousURL
+	if rendURL == "" {
+		rendURL = ww.DefaultRendezvousURL
+	}
+	log.Printf("connecting to rendezvous: %s", rendURL)
 
 	// --- phase 1: rendezvous + offer exchange ---
 	type offerResult struct {
