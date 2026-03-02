@@ -71,7 +71,9 @@ func handleConn(ctx context.Context, conn net.Conn, filePath string) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	defer f.Close()
+	// Use a closure defer so that reassigning f (on file rotation) still closes
+	// the current file on exit.
+	defer func() { f.Close() }()
 
 	w := bufio.NewWriter(conn)
 	r := bufio.NewReader(f)
@@ -104,6 +106,23 @@ func handleConn(ctx context.Context, conn net.Conn, filePath string) {
 		pending.WriteString(line)
 
 		if err == io.EOF {
+			// Check whether the file at filePath has been replaced (new
+			// execution). os.SameFile compares device+inode on Unix.
+			if newInfo, statErr := os.Stat(filePath); statErr == nil {
+				if oldInfo, statErr := f.Stat(); statErr == nil && !os.SameFile(oldInfo, newInfo) {
+					log.Printf("agent: new file detected at %s — restarting stream", filePath)
+					f.Close()
+					newF, openErr := os.Open(filePath)
+					if openErr != nil {
+						log.Printf("agent: reopen %s: %v", filePath, openErr)
+						return
+					}
+					f = newF
+					r.Reset(f)
+					pending.Reset()
+					continue
+				}
+			}
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
