@@ -2,6 +2,8 @@ module github.com/btraven00/obadm
 
 go 1.24.0
 
+replace nhooyr.io/websocket => ./internal/wshim
+
 require (
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/google/uuid v1.6.0
