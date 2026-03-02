@@ -1,6 +1,7 @@
 package sshconn
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,16 +11,20 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 )
 
 const (
-	githubRepo   = "btraven00/obadm"
-	githubTag    = "nightly"
-	agentAsset   = "obadm-agent_linux_amd64"
+	githubRepo = "btraven00/obadm"
+	githubTag  = "nightly"
+	agentAsset = "obadm-agent_linux_amd64"
 )
+
+// GitHubAPIBase is the base URL for GitHub API calls. Override in tests.
+var GitHubAPIBase = "https://api.github.com"
 
 // Deploy uploads localBinary to agentPath on the remote host via SFTP.
 // cfg must have Host set; User and IdentityFile are resolved from ~/.ssh/config.
@@ -75,21 +80,58 @@ func ensureAgent(ctx context.Context, sshClient *gossh.Client, agentPath, remote
 		return "", "", err
 	}
 
-	if _, err := sc.Stat(rpath); err == nil {
-		log.Printf("agent found at %s", rpath)
+	if _, statErr := sc.Stat(rpath); statErr != nil {
+		log.Printf("agent not found at %s — deploying", rpath)
+		rel, err := fetchRelease(ctx)
+		if err != nil {
+			return "", "", fmt.Errorf("fetch release metadata: %w", err)
+		}
+		tmpPath, err := downloadAgent(ctx, rel)
+		if err != nil {
+			return "", "", err
+		}
+		defer os.Remove(tmpPath)
+		if err := uploadViaFTP(sc, tmpPath, rpath); err != nil {
+			return "", "", err
+		}
 		return rpath, fileRPath, nil
 	}
 
-	log.Printf("agent not found at %s — downloading...", rpath)
+	// Binary exists — check if outdated. Use a short timeout so a slow
+	// GitHub API or unresponsive remote never blocks stream startup.
+	updateCtx, updateCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer updateCancel()
 
-	tmpPath, err := downloadLatestAgent(ctx)
+	rel, err := fetchRelease(updateCtx)
 	if err != nil {
-		return "", "", err
+		log.Printf("warning: could not fetch release metadata: %v — skipping update check", err)
+		return rpath, fileRPath, nil
 	}
-	defer os.Remove(tmpPath)
 
-	if err := uploadViaFTP(sc, tmpPath, rpath); err != nil {
-		return "", "", err
+	expected, err := fetchExpectedChecksum(updateCtx, rel)
+	if err != nil {
+		log.Printf("warning: could not fetch expected checksum: %v — skipping update check", err)
+		return rpath, fileRPath, nil
+	}
+
+	actual, err := remoteChecksum(updateCtx, sshClient, rpath)
+	if err != nil {
+		log.Printf("warning: could not compute remote checksum: %v — skipping update check", err)
+		return rpath, fileRPath, nil
+	}
+
+	if actual != expected {
+		log.Printf("agent outdated (%s… → %s…) — updating", actual[:12], expected[:12])
+		tmpPath, err := downloadAgent(ctx, rel)
+		if err != nil {
+			return "", "", err
+		}
+		defer os.Remove(tmpPath)
+		if err := uploadViaFTP(sc, tmpPath, rpath); err != nil {
+			return "", "", err
+		}
+	} else {
+		log.Printf("agent up to date (%s)", rpath)
 	}
 
 	return rpath, fileRPath, nil
@@ -115,42 +157,121 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
-func downloadLatestAgent(ctx context.Context) (string, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", githubRepo, githubTag)
+func (r *githubRelease) assetURL(name string) (string, bool) {
+	for _, a := range r.Assets {
+		if a.Name == name {
+			return a.BrowserDownloadURL, true
+		}
+	}
+	return "", false
+}
+
+func fetchRelease(ctx context.Context) (*githubRelease, error) {
+	apiURL := fmt.Sprintf("%s/repos/%s/releases/tags/%s", GitHubAPIBase, githubRepo, githubTag)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("github releases API: %w", err)
+		return nil, fmt.Errorf("github releases API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github releases API %s (repo: %s, tag: %s)", resp.Status, githubRepo, githubTag)
+		return nil, fmt.Errorf("github releases API %s (repo: %s, tag: %s)", resp.Status, githubRepo, githubTag)
 	}
 
 	var rel githubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", fmt.Errorf("decode release: %w", err)
+		return nil, fmt.Errorf("decode release: %w", err)
 	}
+	return &rel, nil
+}
 
-	var dlURL string
-	for _, a := range rel.Assets {
-		if a.Name == agentAsset {
-			dlURL = a.BrowserDownloadURL
-			break
-		}
+func downloadAgent(ctx context.Context, rel *githubRelease) (string, error) {
+	dlURL, ok := rel.assetURL(agentAsset)
+	if !ok {
+		return "", fmt.Errorf("asset %q not found in release", agentAsset)
 	}
-	if dlURL == "" {
-		return "", fmt.Errorf("asset %q not found in latest release", agentAsset)
-	}
-
 	log.Printf("downloading %s...", dlURL)
 	return downloadToTemp(ctx, dlURL)
+}
+
+const checksumsAsset = "checksums.txt"
+
+// fetchExpectedChecksum downloads checksums.txt from the release and returns
+// the SHA256 hex string for agentAsset.
+func fetchExpectedChecksum(ctx context.Context, rel *githubRelease) (string, error) {
+	url, ok := rel.assetURL(checksumsAsset)
+	if !ok {
+		return "", fmt.Errorf("asset %q not found in release", checksumsAsset)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download checksums: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download checksums: %s", resp.Status)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		if path.Base(fields[1]) == agentAsset {
+			return fields[0], nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan checksums: %w", err)
+	}
+	return "", fmt.Errorf("checksum for %q not found in checksums.txt", agentAsset)
+}
+
+// remoteChecksum runs sha256sum on the remote path and returns the hex digest.
+// Respects ctx cancellation so a slow or hung remote command doesn't block forever.
+func remoteChecksum(ctx context.Context, sshClient *gossh.Client, remotePath string) (string, error) {
+	sess, err := sshClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer sess.Close()
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := sess.Output("sha256sum " + remotePath)
+		ch <- result{out, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", fmt.Errorf("sha256sum: %w", ctx.Err())
+	case r := <-ch:
+		if r.err != nil {
+			return "", fmt.Errorf("sha256sum: %w", r.err)
+		}
+		fields := strings.Fields(string(r.data))
+		if len(fields) < 1 {
+			return "", fmt.Errorf("unexpected sha256sum output: %q", string(r.data))
+		}
+		return fields[0], nil
+	}
 }
 
 func downloadToTemp(ctx context.Context, url string) (string, error) {

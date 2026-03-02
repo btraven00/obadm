@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,10 +38,37 @@ func TestConnect_StreamsViaSSH(t *testing.T) {
 	}
 
 	// Create a dummy agent binary so ensureAgent finds it via SFTP stat.
+	agentData := []byte("#!/bin/sh\n")
 	agentPath := filepath.Join(dir, "obadm-agent")
-	if err := os.WriteFile(agentPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(agentPath, agentData, 0o755); err != nil {
 		t.Fatal(err)
 	}
+
+	// Mock GitHub API so ensureAgent's update check is fast and offline.
+	// Return a checksums.txt whose hash matches the dummy binary so no re-deploy occurs.
+	dummyHash := fmt.Sprintf("%x", sha256.Sum256(agentData))
+	var mockBase string
+	mockHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/releases/tags/"):
+			json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+				"assets": []interface{}{
+					map[string]string{"name": "obadm-agent_linux_amd64", "browser_download_url": mockBase + "/agent"},
+					map[string]string{"name": "checksums.txt", "browser_download_url": mockBase + "/checksums"},
+				},
+			})
+		case r.URL.Path == "/checksums":
+			fmt.Fprintf(w, "%s  dist/obadm-agent_linux_amd64\n", dummyHash) //nolint:errcheck
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(mockHTTP.Close)
+	mockBase = mockHTTP.URL
+
+	origAPIBase := sshconn.GitHubAPIBase
+	sshconn.GitHubAPIBase = mockBase
+	t.Cleanup(func() { sshconn.GitHubAPIBase = origAPIBase })
 
 	// Generate ephemeral client key pair.
 	clientPriv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -125,6 +156,21 @@ func startTestSSHServer(t *testing.T, clientPub gossh.PublicKey, filePath string
 			},
 		},
 		Handler: func(s gssh.Session) {
+			// Handle sha256sum requests from ensureAgent's update check.
+			if cmd := s.RawCommand(); strings.HasPrefix(cmd, "sha256sum ") {
+				p := strings.TrimPrefix(cmd, "sha256sum ")
+				data, err := os.ReadFile(p)
+				if err != nil {
+					fmt.Fprintf(s.Stderr(), "sha256sum: %v\n", err)
+					s.Exit(1)
+					return
+				}
+				h := sha256.Sum256(data)
+				fmt.Fprintf(s, "%x  %s\n", h, p) //nolint:errcheck
+				s.Exit(0)
+				return
+			}
+
 			agentLn, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				fmt.Fprintf(s.Stderr(), "agent listen: %v\n", err)
