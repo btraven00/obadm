@@ -41,7 +41,13 @@ func EnsureRunning(ctx context.Context, otlpAddr string) error {
 
 	log.Printf("aspire: starting dashboard container via %s...", runtime)
 	if err := startDetached(ctx, runtime, mounts); err != nil {
-		return fmt.Errorf("start aspire container: %w", err)
+		if len(mounts) == 0 {
+			return fmt.Errorf("start aspire container: %w", err)
+		}
+		log.Printf("aspire: warning: could not start with branding assets (%v) — retrying without", err)
+		if err := startDetached(ctx, runtime, nil); err != nil {
+			return fmt.Errorf("start aspire container: %w", err)
+		}
 	}
 
 	return waitReady(ctx, otlpAddr, readyTimeout)
