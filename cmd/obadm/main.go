@@ -91,6 +91,7 @@ func main() {
 func runDashboard(args []string) {
 	fs := flag.NewFlagSet("dashboard", flag.ExitOnError)
 	otlpAddr := fs.String("otlp", "localhost:4317", "local OTLP gRPC address to wait on")
+	dashURL := fs.String("url", "http://localhost:18888", "dashboard UI URL to open in browser")
 	fs.Parse(args) //nolint:errcheck
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -99,7 +100,10 @@ func runDashboard(args []string) {
 	if err := aspire.EnsureRunning(ctx, *otlpAddr); err != nil {
 		log.Fatalf("dashboard: %v", err)
 	}
-	log.Printf("dashboard: UI at http://localhost:18888")
+	log.Printf("dashboard: UI at %s", *dashURL)
+	if err := aspire.OpenBrowser(*dashURL); err != nil {
+		log.Printf("dashboard: could not open browser: %v", err)
+	}
 }
 
 func runStream(args []string) {

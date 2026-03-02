@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -204,6 +205,19 @@ func copyAndAppend(ctx context.Context, runtime, containerID, srcPath, dest, app
 	defer f.Close()
 	_, err = f.WriteString(appendContent)
 	return err
+}
+
+// OpenBrowser opens url in the system default browser.
+func OpenBrowser(url string) error {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd, args = "open", []string{url}
+	default: // linux
+		cmd, args = "xdg-open", []string{url}
+	}
+	return exec.Command(cmd, args...).Start()
 }
 
 func waitReady(ctx context.Context, addr string, timeout time.Duration) error {
