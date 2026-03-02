@@ -2,17 +2,20 @@
 
 Admin tools for nicer benchmarking.
 
-## Quick start
+## Install
 
 ```sh
-go build -o obadm ./cmd/obadm
-go build -o obadm-agent ./cmd/obadm-agent
+curl -fsSL "https://github.com/btraven00/obadm/releases/latest/download/obadm_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" -o obadm && chmod +x obadm
 ```
+
+See [INSTALL.md](INSTALL.md) for other installation methods.
+
+## Quick start
 
 With a host configured in `~/.ssh/config`:
 
 ```sh
-./obadm stream myserver:/data/omnibenchmark/telemetry.jsonl
+obadm stream myserver:/data/omnibenchmark/telemetry.jsonl
 ```
 
 This will start the Aspire dashboard if not already running, deploy the agent to the remote host if needed, and stream telemetry to `http://localhost:18888`.
