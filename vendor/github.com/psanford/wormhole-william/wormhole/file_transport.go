@@ -268,7 +268,7 @@ func (t *fileTransport) connectToRelay(ctx context.Context, addr string, success
 		return
 	}
 
-	conn.SetDeadline(time.Now().Add(30 * time.Second)) //nolint:errcheck
+	conn.SetDeadline(time.Now().Add(60 * time.Second)) //nolint:errcheck // relay needs time for both sides to arrive
 
 	_, err = conn.Write(t.relayHandshakeHeader())
 	if err != nil {
