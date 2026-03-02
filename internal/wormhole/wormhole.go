@@ -46,11 +46,15 @@ func Share(ctx context.Context, run *cache.Run, cfg Config, onCode func(string))
 	if onCode != nil {
 		onCode(code)
 	}
-	s := <-status
-	if s.Error != nil {
-		return fmt.Errorf("transfer: %w", s.Error)
+	select {
+	case s := <-status:
+		if s.Error != nil {
+			return fmt.Errorf("transfer: %w", s.Error)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 // DuplicateRunError is returned by Receive when the sender's run ID is

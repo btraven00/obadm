@@ -328,6 +328,7 @@ func runShare(args []string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() { <-ctx.Done(); stop() }()
 
 	if err := obwormhole.Share(ctx, run, obwormhole.Config{}, func(code string) {
 		fmt.Printf("share code: %s\n", code)
@@ -350,6 +351,7 @@ func runReceive(args []string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() { <-ctx.Done(); stop() }()
 
 	run, err := obwormhole.Receive(ctx, code, obwormhole.Config{})
 	if err != nil {
