@@ -39,15 +39,38 @@ func Share(ctx context.Context, run *cache.Run, cfg Config, onCode func(string))
 	defer f.Close()
 
 	c := newClient(cfg)
-	code, status, err := c.SendFile(ctx, run.ID+".jsonl", f)
-	if err != nil {
-		return fmt.Errorf("send: %w", err)
+	rendURL := c.RendezvousURL
+	if rendURL == "" {
+		rendURL = ww.DefaultRendezvousURL
 	}
+	log.Printf("connecting to rendezvous: %s", rendURL)
+
+	type sendResult struct {
+		code   string
+		status chan ww.SendResult
+		err    error
+	}
+	sendCh := make(chan sendResult, 1)
+	go func() {
+		code, status, err := c.SendFile(ctx, run.ID+".jsonl", f)
+		sendCh <- sendResult{code, status, err}
+	}()
+
+	var res sendResult
+	select {
+	case res = <-sendCh:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if res.err != nil {
+		return fmt.Errorf("send: %w", res.err)
+	}
+	log.Printf("rendezvous complete, code ready")
 	if onCode != nil {
-		onCode(code)
+		onCode(res.code)
 	}
 	select {
-	case s := <-status:
+	case s := <-res.status:
 		if s.Error != nil {
 			return fmt.Errorf("transfer: %w", s.Error)
 		}
