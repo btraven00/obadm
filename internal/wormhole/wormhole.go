@@ -103,6 +103,8 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 		return nil, ctx.Err()
 	}
 
+	log.Printf("rendezvous complete, offer: %s (%d bytes); connecting to transit relay...", msg.Name, msg.TransferBytes64)
+
 	// Duplicate check: reject if the sender's run is already cached locally.
 	if srcID := strings.TrimSuffix(msg.Name, ".jsonl"); srcID != msg.Name {
 		if existing, err := cache.Get(srcID); err == nil {
@@ -122,7 +124,7 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 		return nil, fmt.Errorf("open writer: %w", err)
 	}
 
-	log.Printf("receiving %s (%d bytes) → run %s", msg.Name, msg.TransferBytes64, run.ID[:8])
+	log.Printf("transit started, copying to run %s", run.ID[:8])
 
 	// --- phase 2: transit + data copy ---
 	// io.Copy blocks in the transit layer (io.ReadFull with no context).
