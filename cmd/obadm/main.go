@@ -18,8 +18,8 @@ import (
 	"github.com/btraven00/obadm/internal/aspire"
 	"github.com/btraven00/obadm/internal/cache"
 	"github.com/btraven00/obadm/internal/otlp"
+	"github.com/btraven00/obadm/internal/share"
 	"github.com/btraven00/obadm/internal/sshconn"
-	obwormhole "github.com/btraven00/obadm/internal/wormhole"
 )
 
 // Set by -ldflags at build time.
@@ -330,8 +330,9 @@ func runShare(args []string) {
 	defer stop()
 	go func() { <-ctx.Done(); stop() }()
 
-	if err := obwormhole.Share(ctx, run, obwormhole.Config{}, func(code string) {
+	if err := share.Send(ctx, run, share.Config{}, func(code string) {
 		fmt.Printf("share code: %s\n", code)
+		fmt.Printf("receive with: obadm receive %s\n", code)
 		log.Printf("waiting for receiver...")
 	}); err != nil {
 		log.Fatalf("share: %v", err)
@@ -344,7 +345,7 @@ func runReceive(args []string) {
 	fs.Parse(args) //nolint:errcheck
 
 	if fs.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: obadm receive <wormhole-code>")
+		fmt.Fprintln(os.Stderr, "usage: obadm receive <croc-code>")
 		os.Exit(1)
 	}
 	code := fs.Arg(0)
@@ -353,9 +354,9 @@ func runReceive(args []string) {
 	defer stop()
 	go func() { <-ctx.Done(); stop() }()
 
-	run, err := obwormhole.Receive(ctx, code, obwormhole.Config{})
+	run, err := share.Receive(ctx, code, share.Config{})
 	if err != nil {
-		var dupErr *obwormhole.DuplicateRunError
+		var dupErr *share.DuplicateRunError
 		if errors.As(err, &dupErr) {
 			log.Fatalf("run %s already in cache; use: obadm replay %s", dupErr.Run.ID[:8], dupErr.Run.ID[:8])
 		}
