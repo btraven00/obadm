@@ -102,6 +102,7 @@ func runDashboard(args []string) {
 		log.Fatalf("dashboard: %v", err)
 	}
 	log.Printf("dashboard: UI at %s", *dashURL)
+	time.Sleep(1 * time.Second)
 	if err := aspire.OpenBrowser(*dashURL); err != nil {
 		log.Printf("dashboard: could not open browser: %v", err)
 	}
@@ -354,6 +355,7 @@ func runReceive(args []string) {
 	defer stop()
 	go func() { <-ctx.Done(); stop() }()
 
+	log.Printf("connecting to relay...")
 	run, err := share.Receive(ctx, code, share.Config{})
 	if err != nil {
 		var dupErr *share.DuplicateRunError

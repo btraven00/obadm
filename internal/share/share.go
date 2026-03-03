@@ -77,8 +77,8 @@ func Send(ctx context.Context, run *cache.Run, cfg Config, onCode func(string)) 
 	defer os.RemoveAll(tmpDir)
 
 	sendPath := filepath.Join(tmpDir, run.ID+".jsonl")
-	if err := os.Symlink(run.TelemetryPath(), sendPath); err != nil {
-		return fmt.Errorf("symlink: %w", err)
+	if err := copyFile(run.TelemetryPath(), sendPath); err != nil {
+		return fmt.Errorf("copy telemetry: %w", err)
 	}
 
 	filesInfo, emptyFolders, totalFolders, err := croc.GetFilesInfo(
@@ -144,14 +144,23 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	}
 	defer os.Chdir(origDir) //nolint:errcheck
 
+	// logf writes to the real stderr even after croc.New() redirects os.Stderr
+	// to devnull via Quiet:true.
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(origStderr, time.Now().Format("2006/01/02 15:04:05")+" "+format+"\n", args...)
+	}
+
 	// Retry on "room not ready": the sender may not have connected to the relay
 	// yet (transient race at startup, or fast user paste).
+	// Each attempt has a timeout so a hung relay connection doesn't block forever.
 	const maxAttempts = 5
 	const retryDelay = 300 * time.Millisecond
+	const attemptTimeout = 2 * time.Minute
 	var receiveErr error
 	var c *croc.Client
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
+			logf("waiting for sender... (%d/%d)", attempt+1, maxAttempts)
 			select {
 			case <-time.After(retryDelay):
 			case <-ctx.Done():
@@ -167,6 +176,8 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 		go func() { errCh <- c.Receive() }()
 		select {
 		case receiveErr = <-errCh:
+		case <-time.After(attemptTimeout):
+			receiveErr = fmt.Errorf("room (secure channel) not ready, maybe peer disconnected")
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -174,7 +185,6 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 			break
 		}
 		if strings.Contains(receiveErr.Error(), "room") || strings.Contains(receiveErr.Error(), "unexpected end of JSON") {
-			log.Printf("share: receiver waiting for sender (%d/%d)...", attempt+1, maxAttempts)
 			continue
 		}
 		return nil, fmt.Errorf("receive: %w", receiveErr)
@@ -225,6 +235,23 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 		return run, fmt.Errorf("finish: %w", err)
 	}
 	return run, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 type lineCountWriter struct {
