@@ -15,10 +15,24 @@ import (
 	"github.com/schollz/croc/v10/src/tcp"
 )
 
+func TestMain(m *testing.M) {
+	// croc writes verbose progress output to os.Stderr. Redirect it to
+	// /dev/null for the duration of the test binary. Testing output
+	// (t.Log, t.Fatal, etc.) goes through testing.T, not os.Stderr.
+	if devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+		os.Stderr = devNull
+	}
+	os.Exit(m.Run())
+}
+
 // startTestRelay starts a minimal two-port croc relay on random localhost ports
 // and returns a Config pointing at it.
 func startTestRelay(t *testing.T) share.Config {
 	t.Helper()
+	// schollz/logger.SetLevel is not thread-safe. Setting LOGGER causes it to
+	// return early (env var takes precedence), preventing concurrent writes to
+	// the global logger state from tcp.Run goroutines and croc.New() calls.
+	t.Setenv("LOGGER", "info")
 	coordPort := freePort(t)
 	xferPort := freePort(t)
 

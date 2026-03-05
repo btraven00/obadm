@@ -54,7 +54,11 @@ func crocOpts(cfg Config, isSender bool, code string) croc.Options {
 		// Force relay when a custom relay is configured; otherwise allow
 		// croc's default local-network discovery to handle same-machine transfers.
 		DisableLocal: cfg.RelayAddress != "",
-		Quiet:        true,
+		// NOTE: Quiet:true is intentionally omitted. croc.New(Quiet:true)
+		// redirects the global os.Stderr to /dev/null, which is a concurrent
+		// write to a shared variable that races with other goroutines reading
+		// os.Stderr (e.g. concurrent Send+Receive). Callers that want quiet
+		// operation should redirect os.Stderr before invoking Send/Receive.
 	}
 }
 
@@ -62,9 +66,6 @@ func crocOpts(cfg Config, isSender bool, code string) croc.Options {
 // onCode is called with the transfer code once the sender is ready.
 // Send blocks until the transfer completes or ctx is cancelled.
 func Send(ctx context.Context, run *cache.Run, cfg Config, onCode func(string)) error {
-	origStderr := os.Stderr
-	defer func() { os.Stderr = origStderr }()
-
 	code := utils.GetRandomName()
 	log.Printf("share: generated code %s", code)
 
@@ -125,9 +126,6 @@ func (e *DuplicateRunError) Error() string {
 // Returns the new Run on success. Returns *DuplicateRunError if the run is
 // already cached.
 func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
-	origStderr := os.Stderr
-	defer func() { os.Stderr = origStderr }()
-
 	// croc writes files to CWD; use a temp dir so we control the location.
 	tmpDir, err := os.MkdirTemp("", "obadm-recv-*")
 	if err != nil {
@@ -144,12 +142,6 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	}
 	defer os.Chdir(origDir) //nolint:errcheck
 
-	// logf writes to the real stderr even after croc.New() redirects os.Stderr
-	// to devnull via Quiet:true.
-	logf := func(format string, args ...any) {
-		fmt.Fprintf(origStderr, time.Now().Format("2006/01/02 15:04:05")+" "+format+"\n", args...)
-	}
-
 	// Retry on "room not ready": the sender may not have connected to the relay
 	// yet (transient race at startup, or fast user paste).
 	// Each attempt has a timeout so a hung relay connection doesn't block forever.
@@ -160,7 +152,7 @@ func Receive(ctx context.Context, code string, cfg Config) (*cache.Run, error) {
 	var c *croc.Client
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			logf("waiting for sender... (%d/%d)", attempt+1, maxAttempts)
+			log.Printf("share: waiting for sender... (%d/%d)", attempt+1, maxAttempts)
 			select {
 			case <-time.After(retryDelay):
 			case <-ctx.Done():
